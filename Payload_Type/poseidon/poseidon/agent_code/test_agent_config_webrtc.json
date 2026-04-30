@@ -1,0 +1,12 @@
+{
+  "signaling_server": "wss://127.0.0.1:8081/ws",
+  "auth_key": "secret123",
+  "turn_server": "turn:127.0.0.1:3478",
+  "turn_username": "user",
+  "turn_password": "pass",
+  "killdate": "2026-12-31",
+  "encrypted_exchange_check": true,
+  "AESPSK": "qgbrtDu3eaYYUXZmSuaeMpkzI+5mkVjr00iQ4p/xtpU=",
+  "ENDPOINT_REPLACE": "webrtc",
+  "USER_AGENT": ""
+}

@@ -22,6 +22,10 @@ HTTPX_UUID=ad8470b5-7720-4557-a07b-50c3ce519a01
 HTTPX_AGENT_CONFIG_FILE=test_agent_config_httpx.json
 HTTPX_CONFIG=$(shell base64 -i ${HTTPX_AGENT_CONFIG_FILE})
 
+WEBRTC_UUID=3ae42f4e-5758-4c63-b5e7-92a06a700f78
+WEBRTC_AGENT_CONFIG_FILE=test_agent_config_webrtc.json
+WEBRTC_CONFIG=$(shell base64 -i ${WEBRTC_AGENT_CONFIG_FILE})
+
 DNS_UUID=7461e218-d766-4937-87a1-957d9b718455
 DNS_AGENT_CONFIG_FILE=test_agent_config_dns.json
 DNS_CONFIG=$(shell base64 -i ${DNS_AGENT_CONFIG_FILE})
@@ -32,9 +36,10 @@ C2_WEBSOCKET=websocket
 C2_TCP=tcp
 C2_DYNAMICHTTP=dynamichttp
 C2_HTTPX=httpx
+C2_WEBRTC=webrtc
 C2_DNS=dns
 
-EGRESS_ORDER=$(shell echo [\"http\",\"websocket\",\"dynamichttp\",\"dns\"] | base64 -i - )
+EGRESS_ORDER=$(shell echo [\"http\",\"websocket\",\"dynamichttp\",\"webrtc\",\"dns\"] | base64 -i - )
 EGRESS_FAILOVER="failover"
 DEBUG=true
 failedConnectionCountThresholdString=10
@@ -131,6 +136,27 @@ build_httpx:
 -X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.${C2_HTTPX}_initial_config=${HTTPX_CONFIG}'\
 " .
 
+build_webrtc:
+	${goCmd} -o ${BINARY_NAME}_${C2_WEBRTC}.bin -tags="${C2_WEBRTC},debug" -ldflags=" \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.UUID=${WEBRTC_UUID}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.egress_order=${EGRESS_ORDER}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.egress_failover=${EGRESS_FAILOVER}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils.debugString=${DEBUG}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.failedConnectionCountThresholdString=${failedConnectionCountThresholdString}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.${C2_WEBRTC}_initial_config=${WEBRTC_CONFIG}'\
+" .
+
+build_webrtc_http:
+	${goCmd} -o ${BINARY_NAME}_${C2_WEBRTC}_${C2_HTTP}.bin -tags="${C2_WEBRTC},${C2_HTTP},debug" -ldflags=" \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.UUID=${WEBRTC_UUID}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.egress_order=${EGRESS_ORDER}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.egress_failover=${EGRESS_FAILOVER}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils.debugString=${DEBUG}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.failedConnectionCountThresholdString=${failedConnectionCountThresholdString}' \
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.${C2_WEBRTC}_initial_config=${WEBRTC_CONFIG}'\
+-X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.${C2_HTTP}_initial_config=${HTTP_CONFIG}'\
+" .
+
 build_dns:
 	${goCmd} -o ${BINARY_NAME}_${C2_DNS}.bin -tags="${C2_DNS},debug" -ldflags=" \
 -X 'github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/profiles.UUID=${DNS_UUID}' \
@@ -162,6 +188,12 @@ run_websocket_http:
 run_httpx:
 	./${BINARY_NAME}_${C2_HTTPX}.bin
 
+run_webrtc:
+	./${BINARY_NAME}_${C2_WEBRTC}.bin
+
+run_webrtc_http:
+	./${BINARY_NAME}_${C2_WEBRTC}_${C2_HTTP}.bin
+
 run_dns:
 	./${BINARY_NAME}_${C2_DNS}.bin
 
@@ -179,12 +211,18 @@ build_and_run_websocket: build_websocket run_websocket
 
 build_and_run_httpx: build_httpx run_httpx
 
+build_and_run_webrtc: build_webrtc run_webrtc
+
+build_and_run_webrtc_http: build_webrtc_http run_webrtc_http
+
 build_and_run_dns: build_dns run_dns
 
-build_all: build_http build_tcp build_websocket
+build_all: build_http build_tcp build_websocket build_webrtc
 
 clean_http:
 	go clean
 	rm ${BINARY_NAME}_${C2_HTTP}.bin
 	rm ${BINARY_NAME}_${C2_TCP}
 	rm ${BINARY_NAME}_${C2_WEBSOCKET}.bin
+	rm ${BINARY_NAME}_${C2_WEBRTC}.bin
+	rm ${BINARY_NAME}_${C2_WEBRTC}_${C2_HTTP}.bin

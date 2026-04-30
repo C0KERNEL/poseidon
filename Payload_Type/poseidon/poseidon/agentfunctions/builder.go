@@ -43,7 +43,7 @@ var payloadDefinition = agentstructs.PayloadType{
 	CanBeWrappedByTheFollowingPayloadTypes: []string{},
 	SupportsDynamicLoading:                 true,
 	Description:                            fmt.Sprintf("A fully featured macOS and Linux Golang agent.\nNeeds Mythic 3.3.0+\nNOTE: P2P not compatible with v2.1 agents!"),
-	SupportedC2Profiles:                    []string{"http", "websocket", "tcp", "dynamichttp", "webshell", "httpx", "dns"},
+	SupportedC2Profiles:                    []string{"http", "websocket", "tcp", "dynamichttp", "webshell", "httpx", "dns", "webrtc"},
 	MythicEncryptsData:                     true,
 	BuildParameters: []agentstructs.BuildParameter{
 		{
@@ -94,7 +94,7 @@ var payloadDefinition = agentstructs.PayloadType{
 			Description:   "Prioritize the order in which egress connections are made (if including multiple egress c2 profiles)",
 			Required:      false,
 			ParameterType: agentstructs.BUILD_PARAMETER_TYPE_ARRAY,
-			DefaultValue:  []string{"http", "websocket", "dynamichttp", "httpx"},
+			DefaultValue:  []string{"webrtc", "http", "websocket", "dynamichttp", "httpx", "dns"},
 			GroupName:     "egress",
 			UiPosition:    6,
 		},
@@ -167,7 +167,7 @@ var payloadDefinition = agentstructs.PayloadType{
 			}
 			atLeastOneCallbackWithinRange := false
 			for activeC2, _ := range sleepInfo {
-				if activeC2 == "websocket" && callback.LastCheckin.Unix() == 0 {
+				if (activeC2 == "websocket" || activeC2 == "webrtc") && callback.LastCheckin.Unix() == 0 {
 					atLeastOneCallbackWithinRange = true
 					continue
 				}
