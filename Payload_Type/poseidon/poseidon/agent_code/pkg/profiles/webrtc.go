@@ -78,7 +78,9 @@ func (e *WebRTCInitialConfig) UnmarshalJSON(data []byte) error {
 	if v, ok := alias["AESPSK"]; ok {
 		e.AESPSK = v.(string)
 	}
-	if v, ok := alias["ENDPOINT_REPLACE"]; ok {
+	if v, ok := alias["websocket_path"]; ok {
+		e.Endpoint = v.(string)
+	} else if v, ok := alias["ENDPOINT_REPLACE"]; ok {
 		e.Endpoint = v.(string)
 	}
 	if v, ok := alias["killdate"]; ok {
